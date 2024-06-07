@@ -39,12 +39,22 @@ class ModelResponse:
     system_fingerprint: str
     usage: Usage
 
+import random
+import string
+
+def generate_random_string(length=29):
+    characters = string.ascii_letters + string.digits
+    random_string = ''.join(random.choice(characters) for _ in range(length))
+    return random_string
+
 def rectify_text(content: str) -> ModelResponse:
+    random_string_1 = generate_random_string() # 'chatcmpl-9XEpc5YaNIltTVcv1sxmbsLJi1ZO7'
+    random_string_2 = generate_random_string(10) # 'fp_319be4768e' always this for first prompt None for second one
     message = Message(content=content, role='assistant')
     choice = Choices(finish_reason='stop', index=0, message=message)
-    usage = Usage(completion_tokens=37, prompt_tokens=1576, total_tokens=1613)
+    usage = Usage(completion_tokens=0, prompt_tokens=0, total_tokens=0)
     model_response = ModelResponse(
-        id='chatcmpl-9XEpc5YaNIltTVcv1sxmbsLJi1ZO7',
+        id='chatcmpl-'+random_string_1,
         choices=[choice],
         created=int(time.time()),
         model='gpt-4o-2024-05-13',
@@ -53,7 +63,6 @@ def rectify_text(content: str) -> ModelResponse:
         usage=usage
     )
     return model_response
-
 
 # from diskcache import Cache
 
@@ -114,22 +123,17 @@ def send_with_retries(model_name, messages, functions, stream, temperature=0):
         return hash_object, CACHE[key]
 
     # del kwargs['stream']
-    # sentinel = "END"
-    # res = ""
-    # for line in iter(input, sentinel):
-    #     res += line + "\n"
-    # res = input("Paste your chatGPT response here: ")
 
-    res = rectify_text('Documents/mydocs/Programming/aider_test/main.py\n```python\n<<<<<<< SEARCH\nfor i in range(5):\n=======\nfor i in range(10):\n>>>>>>> REPLACE\n```')
+    res = input("Paste your chatGPT response here: ")
+    res = res.encode().decode('unicode_escape')
+    res = rectify_text(res)
 
     # res = litellm.completion(**kwargs)
-    print('resresres: ', res)
 
     if not stream and CACHE is not None:
         CACHE[key] = res
 
     return hash_object, res
-
 
 def simple_send_with_retries(model_name, messages):
     try:
