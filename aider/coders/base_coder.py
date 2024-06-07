@@ -604,7 +604,6 @@ class Coder:
                 return
 
     def run_loop(self):
-        print('run_loop: ', self.run_loop)
         inp = self.io.get_input(
             self.root,
             self.get_inchat_relative_files(),
