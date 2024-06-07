@@ -604,6 +604,7 @@ class Coder:
                 return
 
     def run_loop(self):
+        print('run_loop: ', self.run_loop)
         inp = self.io.get_input(
             self.root,
             self.get_inchat_relative_files(),
@@ -619,7 +620,7 @@ class Coder:
 
         self.check_for_file_mentions(inp)
         inp = self.check_for_urls(inp)
-
+        print('inp: ', inp)
         return inp
 
     def check_for_urls(self, inp):
@@ -952,6 +953,8 @@ class Coder:
         return prompts.added_files.format(fnames=", ".join(mentioned_rel_fnames))
 
     def send(self, messages, model=None, functions=None):
+        self.stream = False
+        print('messages: ', messages, "\n\n")
         if not model:
             model = self.main_model.name
 
