@@ -10,6 +10,8 @@ from pathlib import Path
 from grep_ast import TreeContext, filename_to_lang
 from tree_sitter_languages import get_parser  # noqa: E402
 
+from aider.dump import dump  # noqa: F401
+
 # tree_sitter is throwing a FutureWarning
 warnings.simplefilter("ignore", category=FutureWarning)
 
@@ -33,7 +35,10 @@ class Linter:
 
     def get_rel_fname(self, fname):
         if self.root:
-            return os.path.relpath(fname, self.root)
+            try:
+                return os.path.relpath(fname, self.root)
+            except ValueError:
+                return fname
         else:
             return fname
 
@@ -41,11 +46,20 @@ class Linter:
         cmd += " " + rel_fname
         cmd = cmd.split()
 
-        process = subprocess.Popen(
-            cmd, cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-        )
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                encoding=self.encoding,
+                errors="replace",
+                cwd=self.root,
+            )
+        except OSError as err:
+            print(f"Unable to execute lint command: {err}")
+            return
         stdout, _ = process.communicate()
-        errors = stdout.decode()
+        errors = stdout
         if process.returncode == 0:
             return  # zero exit status
 
@@ -53,17 +67,27 @@ class Linter:
         res = f"## Running: {cmd}\n\n"
         res += errors
 
+        return self.errors_to_lint_result(rel_fname, res)
+
+    def errors_to_lint_result(self, rel_fname, errors):
+        if not errors:
+            return
+
         linenums = []
         filenames_linenums = find_filenames_and_linenums(errors, [rel_fname])
         if filenames_linenums:
             filename, linenums = next(iter(filenames_linenums.items()))
             linenums = [num - 1 for num in linenums]
 
-        return LintResult(text=res, lines=linenums)
+        return LintResult(text=errors, lines=linenums)
 
     def lint(self, fname, cmd=None):
         rel_fname = self.get_rel_fname(fname)
-        code = Path(fname).read_text(self.encoding)
+        try:
+            code = Path(fname).read_text(encoding=self.encoding, errors="replace")
+        except OSError as err:
+            print(f"Unable to read {fname}: {err}")
+            return
 
         if cmd:
             cmd = cmd.strip()
@@ -77,33 +101,26 @@ class Linter:
                 cmd = self.languages.get(lang)
 
         if callable(cmd):
-            linkres = cmd(fname, rel_fname, code)
+            lintres = cmd(fname, rel_fname, code)
         elif cmd:
-            linkres = self.run_cmd(cmd, rel_fname, code)
+            lintres = self.run_cmd(cmd, rel_fname, code)
         else:
-            linkres = basic_lint(rel_fname, code)
+            lintres = basic_lint(rel_fname, code)
 
-        if not linkres:
+        if not lintres:
             return
 
         res = "# Fix any errors below, if possible.\n\n"
-        res += linkres.text
+        res += lintres.text
         res += "\n"
-        res += tree_context(rel_fname, code, linkres.lines)
+        res += tree_context(rel_fname, code, lintres.lines)
 
         return res
 
     def py_lint(self, fname, rel_fname, code):
         basic_res = basic_lint(rel_fname, code)
         compile_res = lint_python_compile(fname, code)
-
-        fatal = "E9,F821,F823,F831,F406,F407,F701,F702,F704,F706"
-        flake8 = f"flake8 --select={fatal} --show-source --isolated"
-
-        try:
-            flake_res = self.run_cmd(flake8, rel_fname, code)
-        except FileNotFoundError:
-            flake_res = None
+        flake_res = self.flake8_lint(rel_fname)
 
         text = ""
         lines = set()
@@ -117,6 +134,40 @@ class Linter:
 
         if text or lines:
             return LintResult(text, lines)
+
+    def flake8_lint(self, rel_fname):
+        fatal = "E9,F821,F823,F831,F406,F407,F701,F702,F704,F706"
+        flake8_cmd = [
+            sys.executable,
+            "-m",
+            "flake8",
+            f"--select={fatal}",
+            "--show-source",
+            "--isolated",
+            rel_fname,
+        ]
+
+        text = f"## Running: {' '.join(flake8_cmd)}\n\n"
+
+        try:
+            result = subprocess.run(
+                flake8_cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                encoding=self.encoding,
+                errors="replace",
+                cwd=self.root,
+            )
+            errors = result.stdout + result.stderr
+        except Exception as e:
+            errors = f"Error running flake8: {str(e)}"
+
+        if not errors:
+            return
+
+        text += errors
+        return self.errors_to_lint_result(rel_fname, text)
 
 
 @dataclass
@@ -158,10 +209,24 @@ def basic_lint(fname, code):
     if not lang:
         return
 
-    parser = get_parser(lang)
+    # Tree-sitter linter is not capable of working with typescript #1132
+    if lang == "typescript":
+        return
+
+    try:
+        parser = get_parser(lang)
+    except Exception as err:
+        print(f"Unable to load parser: {err}")
+        return
+
     tree = parser.parse(bytes(code, "utf-8"))
 
-    errors = traverse_tree(tree.root_node)
+    try:
+        errors = traverse_tree(tree.root_node)
+    except RecursionError:
+        print(f"Unable to lint {fname} due to RecursionError")
+        return
+
     if not errors:
         return
 

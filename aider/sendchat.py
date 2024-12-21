@@ -1,12 +1,10 @@
 import hashlib
 import json
-
-import backoff
-import httpx
-import openai
+import time
 
 from aider.dump import dump  # noqa: F401
-from aider.litellm import litellm
+from aider.exceptions import LiteLLMExceptions
+from aider.llm import litellm
 
 from dataclasses import dataclass
 from typing import List
@@ -71,48 +69,32 @@ CACHE_PATH = "~/.aider.send.cache.v1"
 CACHE = None
 # CACHE = Cache(CACHE_PATH)
 
-
-def should_giveup(e):
-    if not hasattr(e, "status_code"):
-        return False
-
-    if type(e) in (
-        httpx.ConnectError,
-        httpx.RemoteProtocolError,
-        httpx.ReadTimeout,
-    ):
-        return False
-
-    return not litellm._should_retry(e.status_code)
+RETRY_TIMEOUT = 60
 
 
-@backoff.on_exception(
-    backoff.expo,
-    (
-        httpx.ConnectError,
-        httpx.RemoteProtocolError,
-        httpx.ReadTimeout,
-        litellm.exceptions.APIConnectionError,
-        litellm.exceptions.APIError,
-        litellm.exceptions.RateLimitError,
-        litellm.exceptions.ServiceUnavailableError,
-        litellm.exceptions.Timeout,
-    ),
-    giveup=should_giveup,
-    max_time=60,
-    on_backoff=lambda details: print(
-        f"{details.get('exception','Exception')}\nRetry in {details['wait']:.1f} seconds."
-    ),
-)
-def send_with_retries(model_name, messages, functions, stream, temperature=0):
+def send_completion(
+    model_name,
+    messages,
+    functions,
+    stream,
+    temperature=0,
+    extra_params=None,
+):
     kwargs = dict(
         model=model_name,
         messages=messages,
-        temperature=temperature,
         stream=stream,
     )
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+
     if functions is not None:
-        kwargs["functions"] = functions
+        function = functions[0]
+        kwargs["tools"] = [dict(type="function", function=function)]
+        kwargs["tool_choice"] = {"type": "function", "function": {"name": function["name"]}}
+
+    if extra_params is not None:
+        kwargs.update(extra_params)
 
     key = json.dumps(kwargs, sort_keys=True).encode()
 
@@ -135,14 +117,55 @@ def send_with_retries(model_name, messages, functions, stream, temperature=0):
 
     return hash_object, res
 
-def simple_send_with_retries(model_name, messages):
-    try:
-        _hash, response = send_with_retries(
-            model_name=model_name,
-            messages=messages,
-            functions=None,
-            stream=False,
-        )
-        return response.choices[0].message.content
-    except (AttributeError, openai.BadRequestError):
-        return
+# def simple_send_with_retries(model_name, messages):
+#     try:
+#         _hash, response = send_with_retries(
+#             model_name=model_name,
+#             messages=messages,
+#             functions=None,
+#             stream=False,
+#         )
+#         return response.choices[0].message.content
+#     except (AttributeError, openai.BadRequestError):
+#         return
+
+def simple_send_with_retries(model, messages):
+    litellm_ex = LiteLLMExceptions()
+
+    retry_delay = 0.125
+    while True:
+        try:
+            kwargs = {
+                "model_name": model.name,
+                "messages": messages,
+                "functions": None,
+                "stream": False,
+                "temperature": None if not model.use_temperature else 0,
+                "extra_params": model.extra_params,
+            }
+
+            _hash, response = send_completion(**kwargs)
+            if not response or not hasattr(response, "choices") or not response.choices:
+                return None
+            return response.choices[0].message.content
+        except litellm_ex.exceptions_tuple() as err:
+            ex_info = litellm_ex.get_ex_info(err)
+
+            print(str(err))
+            if ex_info.description:
+                print(ex_info.description)
+
+            should_retry = ex_info.retry
+            if should_retry:
+                retry_delay *= 2
+                if retry_delay > RETRY_TIMEOUT:
+                    should_retry = False
+
+            if not should_retry:
+                return None
+
+            print(f"Retrying in {retry_delay:.1f} seconds...")
+            time.sleep(retry_delay)
+            continue
+        except AttributeError:
+            return None

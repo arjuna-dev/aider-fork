@@ -1,211 +1,273 @@
 #!/usr/bin/env python3
 
+import argparse
+import os
 import subprocess
 import sys
-import tempfile
-from pathlib import Path
+from collections import defaultdict
+from datetime import datetime
+from operator import itemgetter
 
-import pylab as plt
-from imgcat import imgcat
+import semver
+import yaml
+from tqdm import tqdm
 
-from aider.dump import dump
+website_files = [
+    "aider/website/share/index.md",
+    "aider/website/_includes/head_custom.html",
+    "aider/website/docs/leaderboards/index.md",
+]
 
-
-def get_lines_with_commit_hash(filename, aider_commits, git_dname, verbose=False):
-    result = subprocess.run(
-        ["git", "-C", git_dname, "blame", "-w", "-l", filename],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-
-    hashes = [line.split()[0] for line in result.stdout.splitlines()]
-    lines = Path(filename).read_text().splitlines()
-
-    num_aider_lines = 0
-    for hsh, line in zip(hashes, lines):
-        if hsh in aider_commits:
-            num_aider_lines += 1
-            prefix = "+"
-        else:
-            prefix = " "
-
-        if verbose:
-            print(f"{prefix}{line}")
-
-    num_lines = len(lines)
-
-    return num_lines, num_aider_lines
+exclude_files = [
+    "aider/website/install.ps1",
+    "aider/website/install.sh",
+]
 
 
-def get_aider_commits(git_dname):
-    """Get commit hashes for commits with messages starting with 'aider:'"""
+def blame(start_tag, end_tag=None):
+    commits = get_all_commit_hashes_between_tags(start_tag, end_tag)
+    commits = [commit[:hash_len] for commit in commits]
 
-    result = subprocess.run(
-        ["git", "-C", git_dname, "log", "--pretty=format:%H %s"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    authors = get_commit_authors(commits)
 
-    results = result.stdout.splitlines()
-    dump(len(results))
+    revision = end_tag if end_tag else "HEAD"
+    files = run(["git", "ls-tree", "-r", "--name-only", revision]).strip().split("\n")
+    files = [
+        f
+        for f in files
+        if f.endswith((".js", ".py", ".scm", ".sh", "Dockerfile", "Gemfile"))
+        or (f.startswith(".github/workflows/") and f.endswith(".yml"))
+        or f in website_files
+    ]
+    files = [f for f in files if not f.endswith("prompts.py")]
+    files = [f for f in files if not f.startswith("tests/fixtures/watch")]
+    files = [f for f in files if f not in exclude_files]
 
-    commits = set()
-    for line in results:
-        commit_hash, commit_message = line.split(" ", 1)
-        if commit_message.startswith("aider:"):
-            commits.add(commit_hash)
+    all_file_counts = {}
+    grand_total = defaultdict(int)
+    aider_total = 0
+    for file in files:
+        file_counts = get_counts_for_file(start_tag, end_tag, authors, file)
+        if file_counts:
+            all_file_counts[file] = file_counts
+            for author, count in file_counts.items():
+                grand_total[author] += count
+                if "(aider)" in author.lower():
+                    aider_total += count
 
-    dump(len(commits))
+    total_lines = sum(grand_total.values())
+    aider_percentage = (aider_total / total_lines) * 100 if total_lines > 0 else 0
 
-    return commits
+    end_date = get_tag_date(end_tag if end_tag else "HEAD")
+
+    return all_file_counts, grand_total, total_lines, aider_total, aider_percentage, end_date
 
 
-def show_commit_stats(commits):
-    total_added_lines = 0
-    total_deleted_lines = 0
+def get_all_commit_hashes_between_tags(start_tag, end_tag=None):
+    if end_tag:
+        res = run(["git", "rev-list", f"{start_tag}..{end_tag}"])
+    else:
+        res = run(["git", "rev-list", f"{start_tag}..HEAD"])
 
+    if res:
+        commit_hashes = res.strip().split("\n")
+        return commit_hashes
+
+
+def run(cmd):
+    # Get all commit hashes since the specified tag
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return result.stdout
+
+
+def get_commit_authors(commits):
+    commit_to_author = dict()
     for commit in commits:
-        result = subprocess.run(
-            ["git", "show", "--stat", "--oneline", commit],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-
-        added_lines = 0
-        deleted_lines = 0
-        for line in result.stdout.splitlines():
-            if "changed," not in line:
-                continue
-            if "insertion" not in line and "deletion" not in line:
-                continue
-            dump(line)
-            pieces = line.split(",")
-            try:
-                for piece in pieces:
-                    if "insertion" in piece:
-                        dump(piece)
-                        added_lines += int(piece.strip().split()[0])
-                    if "deletion" in piece:
-                        dump(piece)
-                        deleted_lines += int(piece.strip().split()[0])
-            except ValueError:
-                pass
-
-        total_added_lines += added_lines
-        total_deleted_lines += deleted_lines
-
-        print(f"Commit {commit}: +{added_lines} -{deleted_lines}")
-
-    print(f"Total: +{total_added_lines} -{total_deleted_lines}")
+        author = run(["git", "show", "-s", "--format=%an", commit]).strip()
+        commit_message = run(["git", "show", "-s", "--format=%s", commit]).strip()
+        if commit_message.lower().startswith("aider:"):
+            author += " (aider)"
+        commit_to_author[commit] = author
+    return commit_to_author
 
 
-def process_fnames(fnames, git_dname):
-    if not git_dname:
-        git_dname = "."
-
-    aider_commits = get_aider_commits(git_dname)
-    # show_commit_stats(aider_commits)
-
-    total_lines = 0
-    total_aider_lines = 0
-
-    for fname in fnames:
-        num_lines, num_aider_lines = get_lines_with_commit_hash(fname, aider_commits, git_dname)
-        total_lines += num_lines
-        total_aider_lines += num_aider_lines
-        percent_modified = (num_aider_lines / num_lines) * 100 if num_lines > 0 else 0
-        if not num_aider_lines:
-            continue
-        print(f"|{fname}| {num_aider_lines} of {num_lines} | {percent_modified:.1f}% |")
-
-    total_percent_modified = (total_aider_lines / total_lines) * 100 if total_lines > 0 else 0
-    print(
-        f"| **Total** | **{total_aider_lines} of {total_lines}** | {total_percent_modified:.1f}% |"
-    )
-    return total_aider_lines, total_lines, total_percent_modified
+hash_len = len("44e6fefc2")
 
 
-def process_repo(git_dname=None):
-    if not git_dname:
-        git_dname = "."
+def process_all_tags_since(start_tag):
+    tags = get_all_tags_since(start_tag)
+    # tags += ['HEAD']
 
-    result = subprocess.run(
-        ["git", "-C", git_dname, "ls-files"], capture_output=True, text=True, check=True
-    )
-    git_dname = Path(git_dname)
-    fnames = [git_dname / fname for fname in result.stdout.splitlines() if fname.endswith(".py")]
-
-    return process_fnames(fnames, git_dname)
-
-
-def history():
-    git_dname = "."
-    result = subprocess.run(
-        ["git", "-C", git_dname, "log", "--pretty=format:%H %s"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-
-    commits = []
-    for line in result.stdout.splitlines():
-        commit_hash, commit_message = line.split(" ", 1)
-        commits.append(commit_hash)
-
-    commits.reverse()
-    dump(len(commits))
-
-    num_commits = len(commits)
-    N = 10
-    step = (num_commits - 1) / (N - 1)
     results = []
-    i = 0
-    while i < num_commits:
-        commit_num = int(i)
-        dump(i, commit_num, num_commits)
-        i += step
+    for i in tqdm(range(len(tags) - 1), desc="Processing tags"):
+        start_tag, end_tag = tags[i], tags[i + 1]
+        all_file_counts, grand_total, total_lines, aider_total, aider_percentage, end_date = blame(
+            start_tag, end_tag
+        )
+        results.append(
+            {
+                "start_tag": start_tag,
+                "end_tag": end_tag,
+                "end_date": end_date.strftime("%Y-%m-%d"),
+                "file_counts": all_file_counts,
+                "grand_total": {
+                    author: count
+                    for author, count in sorted(
+                        grand_total.items(), key=itemgetter(1), reverse=True
+                    )
+                },
+                "total_lines": total_lines,
+                "aider_total": aider_total,
+                "aider_percentage": round(aider_percentage, 2),
+            }
+        )
+    return results
 
-        commit = commits[commit_num]
 
-        repo_dname = tempfile.TemporaryDirectory().name
-        cmd = f"git clone . {repo_dname}"
-        subprocess.run(cmd.split(), check=True)
-        dump(commit)
-        cmd = f"git -c advice.detachedHead=false -C {repo_dname} checkout {commit}"
-        subprocess.run(cmd.split(), check=True)
-
-        aider_lines, total_lines, pct = process_repo(repo_dname)
-        results.append((commit_num, aider_lines, total_lines, pct))
-
-    dump(results)
-
-    # Plotting the results
-    x = [i for i, _, _, _ in results]
-    aider_lines = [aider_lines for _, aider_lines, _, _ in results]
-    total_lines = [total_lines for _, _, total_lines, _ in results]
-
-    plt.fill_between(x, aider_lines, label="Aider Lines", color="skyblue", alpha=0.5)
-    plt.fill_between(x, total_lines, label="Total Lines", color="lightgreen", alpha=0.5)
-    plt.xlabel("Commit Number")
-    plt.ylabel("Lines of Code")
-    plt.title("Aider Lines and Total Lines Over Time")
-    plt.legend()
-    plt.savefig("aider_plot.png")
-    with open("aider_plot.png", "rb") as f:
-        imgcat(f.read())
+def get_latest_version_tag():
+    all_tags = run(["git", "tag", "--sort=-v:refname"]).strip().split("\n")
+    for tag in all_tags:
+        if semver.Version.is_valid(tag[1:]) and tag.endswith(".0"):
+            return tag
+    return None
 
 
 def main():
-    # return history()
+    parser = argparse.ArgumentParser(description="Get aider/non-aider blame stats")
+    parser.add_argument("start_tag", nargs="?", help="The tag to start from (optional)")
+    parser.add_argument("--end-tag", help="The tag to end at (default: HEAD)", default=None)
+    parser.add_argument(
+        "--all-since",
+        action="store_true",
+        help=(
+            "Find all tags since the specified tag and print aider percentage between each pair of"
+            " successive tags"
+        ),
+    )
+    parser.add_argument(
+        "--output", help="Output file to save the YAML results", type=str, default=None
+    )
+    args = parser.parse_args()
 
-    if len(sys.argv) < 2:
-        return process_repo()
+    if not args.start_tag:
+        args.start_tag = get_latest_version_tag()
+        if not args.start_tag:
+            print("Error: No valid vX.Y.0 tag found.")
+            return
 
-    fnames = sys.argv[1:]
-    process_fnames(fnames, ".")
+    if args.all_since:
+        new_results = process_all_tags_since(args.start_tag)
+
+        # If output file exists, read and update it
+        existing_results = []
+        if args.output and os.path.exists(args.output):
+            with open(args.output, "r") as f:
+                existing_results = yaml.safe_load(f) or []
+
+        # Create a map of start_tag->end_tag to result for existing entries
+        existing_map = {(r["start_tag"], r["end_tag"]): i for i, r in enumerate(existing_results)}
+
+        # Update or append new results
+        for new_result in new_results:
+            key = (new_result["start_tag"], new_result["end_tag"])
+            if key in existing_map:
+                # Replace existing entry
+                existing_results[existing_map[key]] = new_result
+            else:
+                # Append new entry
+                existing_results.append(new_result)
+
+        # Sort results by start_tag
+        existing_results.sort(key=lambda x: semver.Version.parse(x["start_tag"][1:]))
+
+        yaml_output = yaml.dump(existing_results, sort_keys=True)
+    else:
+        all_file_counts, grand_total, total_lines, aider_total, aider_percentage, end_date = blame(
+            args.start_tag, args.end_tag
+        )
+
+        result = {
+            "start_tag": args.start_tag,
+            "end_tag": args.end_tag or "HEAD",
+            "end_date": end_date.strftime("%Y-%m-%d"),
+            "file_counts": all_file_counts,
+            "grand_total": {
+                author: count
+                for author, count in sorted(grand_total.items(), key=itemgetter(1), reverse=True)
+            },
+            "total_lines": total_lines,
+            "aider_total": aider_total,
+            "aider_percentage": round(aider_percentage, 2),
+        }
+
+        yaml_output = yaml.dump(result, sort_keys=True)
+
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(yaml_output)
+    else:
+        print(yaml_output)
+
+    if not args.all_since:
+        print(f"- Aider wrote {round(aider_percentage)}% of the code in this release.")
+
+
+def get_counts_for_file(start_tag, end_tag, authors, fname):
+    try:
+        if end_tag:
+            text = run(
+                [
+                    "git",
+                    "blame",
+                    "-M",
+                    "-C",
+                    "-C",
+                    "--abbrev=9",
+                    f"{start_tag}..{end_tag}",
+                    "--",
+                    fname,
+                ]
+            )
+        else:
+            text = run(
+                ["git", "blame", "-M", "-C", "-C", "--abbrev=9", f"{start_tag}..HEAD", "--", fname]
+            )
+        if not text:
+            return None
+        text = text.splitlines()
+        line_counts = defaultdict(int)
+        for line in text:
+            if line.startswith("^"):
+                continue
+            hsh = line[:hash_len]
+            author = authors.get(hsh, "Unknown")
+            line_counts[author] += 1
+
+        return dict(line_counts)
+    except subprocess.CalledProcessError as e:
+        if "no such path" in str(e).lower():
+            # File doesn't exist in this revision range, which is okay
+            return None
+        else:
+            # Some other error occurred
+            print(f"Warning: Unable to blame file {fname}. Error: {e}", file=sys.stderr)
+            return None
+
+
+def get_all_tags_since(start_tag):
+    all_tags = run(["git", "tag", "--sort=v:refname"]).strip().split("\n")
+    start_version = semver.Version.parse(start_tag[1:])  # Remove 'v' prefix
+    filtered_tags = [
+        tag
+        for tag in all_tags
+        if semver.Version.is_valid(tag[1:]) and semver.Version.parse(tag[1:]) >= start_version
+    ]
+    return [tag for tag in filtered_tags if tag.endswith(".0")]
+
+
+def get_tag_date(tag):
+    date_str = run(["git", "log", "-1", "--format=%ai", tag]).strip()
+    return datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S %z")
 
 
 if __name__ == "__main__":

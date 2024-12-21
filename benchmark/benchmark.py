@@ -6,13 +6,14 @@ import random
 import re
 import shutil
 import subprocess
+import sys
 import time
 import traceback
 from collections import defaultdict
 from json.decoder import JSONDecodeError
 from pathlib import Path
 from types import SimpleNamespace
-from typing import List
+from typing import List, Optional
 
 import git
 import lox
@@ -23,12 +24,10 @@ from dotenv import load_dotenv
 from plots import plot_refactoring
 from rich.console import Console
 
-from aider import models
-from aider.coders import Coder
+from aider import models, sendchat
+from aider.coders import Coder, base_coder
 from aider.dump import dump  # noqa: F401
 from aider.io import InputOutput
-
-load_dotenv()
 
 BENCHMARK_DNAME = Path(os.environ.get("AIDER_BENCHMARK_DIR", "tmp.benchmarks"))
 
@@ -38,6 +37,56 @@ app = typer.Typer(add_completion=False, pretty_exceptions_enable=False)
 
 
 NUM_TESTS = (89, 133)
+
+load_dotenv(override=True)
+
+
+def find_latest_benchmark_dir():
+    benchmark_dirs = [d for d in BENCHMARK_DNAME.iterdir() if d.is_dir()]
+    if not benchmark_dirs:
+        print("Error: No benchmark directories found under tmp.benchmarks.")
+        sys.exit(1)
+
+    # Get current time and 24 hours ago
+    now = datetime.datetime.now()
+    day_ago = now - datetime.timedelta(days=1)
+
+    # Filter directories by name pattern YYYY-MM-DD-HH-MM-SS--
+    recent_dirs = []
+    for d in benchmark_dirs:
+        try:
+            # Extract datetime from directory name
+            date_str = d.name[:19]  # Takes YYYY-MM-DD-HH-MM-SS
+            dir_date = datetime.datetime.strptime(date_str, "%Y-%m-%d-%H-%M-%S")
+            if dir_date >= day_ago:
+                recent_dirs.append(d)
+        except ValueError:
+            # Skip directories that don't match the expected format
+            continue
+
+    if not recent_dirs:
+        print("Error: No benchmark directories found from the last 24 hours.")
+        sys.exit(1)
+
+    # Find directory with most recently modified .md file
+    latest_dir = None
+    latest_time = 0
+
+    for d in recent_dirs:
+        # Look for .md files in subdirectories
+        for md_file in d.glob("*/.*.md"):
+            if md_file.is_file():
+                mtime = md_file.stat().st_mtime
+                if mtime > latest_time:
+                    latest_time = mtime
+                    latest_dir = d
+
+    if not latest_dir:
+        print("Error: No .md files found in recent benchmark directories.")
+        sys.exit(1)
+
+    print(f"Using the most recently updated benchmark directory: {latest_dir.name}")
+    return latest_dir
 
 
 def show_stats(dirnames, graphs):
@@ -106,10 +155,15 @@ def resolve_dirname(dirname, use_single_prior, make_new):
 
 @app.command()
 def main(
-    dirnames: List[str] = typer.Argument(..., help="Directory names"),
+    dirnames: Optional[List[str]] = typer.Argument(None, help="Directory names"),
     graphs: bool = typer.Option(False, "--graphs", help="Generate graphs"),
     model: str = typer.Option("gpt-3.5-turbo", "--model", "-m", help="Model name"),
+    sleep: float = typer.Option(
+        0, "--sleep", help="Sleep seconds between tests when single threaded"
+    ),
     edit_format: str = typer.Option(None, "--edit-format", "-e", help="Edit format"),
+    editor_model: str = typer.Option(None, "--editor-model", help="Editor model name"),
+    editor_edit_format: str = typer.Option(None, "--editor-edit-format", help="Editor edit format"),
     replay: str = typer.Option(
         None,
         "--replay",
@@ -138,6 +192,9 @@ def main(
     tries: int = typer.Option(2, "--tries", "-r", help="Number of tries for running tests"),
     threads: int = typer.Option(1, "--threads", "-t", help="Number of threads to run in parallel"),
     num_tests: int = typer.Option(-1, "--num-tests", "-n", help="Number of tests to run"),
+    num_ctx: Optional[int] = typer.Option(
+        None, "--num-ctx", help="Override model context window size"
+    ),
     exercises_dir: str = typer.Option(
         EXERCISES_DIR_DEFAULT, "--exercises-dir", help="Directory with exercise files"
     ),
@@ -146,6 +203,13 @@ def main(
     commit_hash = repo.head.object.hexsha[:7]
     if repo.is_dirty():
         commit_hash += "-dirty"
+
+    if stats_only and not dirnames:
+        latest_dir = find_latest_benchmark_dir()
+        dirnames = [str(latest_dir)]
+
+    if dirnames is None:
+        dirnames = []
 
     if len(dirnames) > 1 and not (stats_only or diffs_only):
         print("Only provide 1 dirname unless running with --stats or --diffs")
@@ -206,6 +270,11 @@ def main(
     if num_tests > 0:
         test_dnames = test_dnames[:num_tests]
 
+    # Don't give up when benchmarking
+    LONG_TIMEOUT = 24 * 60 * 60
+    sendchat.RETRY_TIMEOUT = LONG_TIMEOUT
+    base_coder.RETRY_TIMEOUT = LONG_TIMEOUT
+
     if threads == 1:
         all_results = []
         for testname in test_dnames:
@@ -221,10 +290,16 @@ def main(
                 commit_hash,
                 replay,
                 max_apply_update_errors,
+                editor_model,
+                editor_edit_format,
+                num_ctx,
+                sleep,
             )
 
             all_results.append(results)
             summarize_results(dirname)
+            if sleep:
+                time.sleep(sleep)
     else:
         run_test_threaded = lox.thread(threads)(run_test)
         for testname in test_dnames:
@@ -240,6 +315,8 @@ def main(
                 commit_hash,
                 replay,
                 max_apply_update_errors,
+                editor_model,
+                editor_edit_format,
             )
         all_results = run_test_threaded.gather(tqdm=True)
 
@@ -350,7 +427,7 @@ def summarize_results(dirname):
         res.syntax_errors += results.get("syntax_errors", 0)
         res.indentation_errors += results.get("indentation_errors", 0)
 
-        for key in "model edit_format commit_hash".split():
+        for key in "model edit_format commit_hash editor_model editor_edit_format".split():
             val = results.get(key)
             if val:
                 variants[key].add(val)
@@ -378,7 +455,7 @@ def summarize_results(dirname):
         pass_rate = 100 * passed_tests[i] / res.completed_tests
         percents[i] = pass_rate
         # console.print(f"{pass_rate:.1f}% correct after try {i+1}")
-        setattr(res, f"pass_rate_{i+1}", f"{pass_rate:.1f}")
+        setattr(res, f"pass_rate_{i + 1}", f"{pass_rate:.1f}")
 
     print(f"- dirname: {dirname.name}")
     style = None if res.completed_tests in NUM_TESTS else "red"
@@ -393,10 +470,10 @@ def summarize_results(dirname):
         console.print(f"  {key}: {val}", style=style)
 
     for i in range(tries):
-        print(f"  pass_rate_{i+1}: {percents[i]:.1f}")
+        print(f"  pass_rate_{i + 1}: {percents[i]:.1f}")
 
     pct_well_formed = 1.0 - res.num_with_malformed_responses / res.completed_tests
-    print(f"  percent_cases_well_formed: {pct_well_formed*100:.1f}")
+    print(f"  percent_cases_well_formed: {pct_well_formed * 100:.1f}")
 
     show("error_outputs")
     show("num_malformed_responses")
@@ -496,6 +573,10 @@ def run_test_real(
     commit_hash,
     replay,
     max_apply_update_errors,
+    editor_model,
+    editor_edit_format,
+    num_ctx=None,
+    sleep=0,
 ):
     if not os.path.isdir(testdir):
         print("Not a dir:", testdir)
@@ -545,11 +626,24 @@ def run_test_real(
 
     io = InputOutput(
         pretty=True,
-        yes=False,
+        yes=True,
         chat_history_file=history_fname,
     )
 
-    main_model = models.Model(model_name)
+    # weak_model_name = model_name
+    weak_model_name = None
+
+    main_model = models.Model(
+        model_name,
+        weak_model=weak_model_name,
+        editor_model=editor_model,
+        editor_edit_format=editor_edit_format,
+    )
+
+    if num_ctx:
+        if not main_model.extra_params:
+            main_model.extra_params = {}
+        main_model.extra_params["num_ctx"] = num_ctx
     edit_format = edit_format or main_model.edit_format
 
     dump(main_model)
@@ -564,10 +658,13 @@ def run_test_real(
         fnames=fnames,
         use_git=False,
         stream=False,
-        pretty=False,
         verbose=verbose,
+        # auto_lint=False,  # disabled for code-in-json experiments
+        cache_prompts=True,
+        suggest_shell_commands=False,
     )
     coder.max_apply_update_errors = max_apply_update_errors
+    coder.show_announcements()
 
     timeouts = 0
 
@@ -591,7 +688,7 @@ def run_test_real(
 
             coder.apply_updates()
         else:
-            response = coder.run(with_message=instructions)
+            response = coder.run(with_message=instructions, preproc=False)
         dur += time.time() - start
 
         if not no_aider:
@@ -657,6 +754,10 @@ def run_test_real(
             )
         ),
     )
+
+    if edit_format == "architect":
+        results["editor_model"] = main_model.editor_model.name if main_model.editor_model else None
+        results["editor_edit_format"] = main_model.editor_edit_format
     dump(results)
 
     results_fname.write_text(json.dumps(results, indent=4))
