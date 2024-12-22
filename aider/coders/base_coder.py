@@ -837,6 +837,7 @@ class Coder:
 
         self.check_for_file_mentions(inp)
         inp = self.check_for_urls(inp)
+
         return inp
 
     def run_one(self, user_message, preproc):
@@ -1535,6 +1536,10 @@ class Coder:
     def send(self, messages, model=None, functions=None):
         self.stream = False
         print('messages: ', messages, "\n\n")
+
+        with open('messages.txt', 'w') as file:
+            file.write(str(messages))
+
         if not model:
             model = self.main_model
 

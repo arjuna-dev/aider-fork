@@ -45,7 +45,7 @@ def generate_random_string(length=29):
     random_string = ''.join(random.choice(characters) for _ in range(length))
     return random_string
 
-def rectify_text(content: str) -> ModelResponse:
+def prepare_text(content: str) -> ModelResponse:
     random_string_1 = generate_random_string() # 'chatcmpl-9XEpc5YaNIltTVcv1sxmbsLJi1ZO7'
     random_string_2 = generate_random_string(10) # 'fp_319be4768e' always this for first prompt None for second one
     message = Message(content=content, role='assistant')
@@ -106,9 +106,18 @@ def send_completion(
 
     # del kwargs['stream']
 
-    res = input("Paste your chatGPT response here: ")
-    res = res.encode().decode('unicode_escape')
-    res = rectify_text(res)
+    # res = input("Paste your chatGPT response here: ")
+
+    input("Press Enter to continue...")
+    # Ensure the file exists by opening in append mode and then closing it
+    with open('response.txt', 'a'):
+        pass
+
+    # Now read the file
+    with open('response.txt', 'r') as file:
+        res = file.read()
+    # res = res.encode().decode('unicode_escape')
+    res = prepare_text(res)
 
     # res = litellm.completion(**kwargs)
 
