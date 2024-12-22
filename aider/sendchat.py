@@ -10,6 +10,9 @@ from dataclasses import dataclass
 from typing import List
 import time
 
+import random
+import string
+
 @dataclass
 class Usage:
     completion_tokens: int
@@ -37,8 +40,6 @@ class ModelResponse:
     system_fingerprint: str
     usage: Usage
 
-import random
-import string
 
 def generate_random_string(length=29):
     characters = string.ascii_letters + string.digits
@@ -47,7 +48,6 @@ def generate_random_string(length=29):
 
 def prepare_text(content: str) -> ModelResponse:
     random_string_1 = generate_random_string() # 'chatcmpl-9XEpc5YaNIltTVcv1sxmbsLJi1ZO7'
-    random_string_2 = generate_random_string(10) # 'fp_319be4768e' always this for first prompt None for second one
     message = Message(content=content, role='assistant')
     choice = Choices(finish_reason='stop', index=0, message=message)
     usage = Usage(completion_tokens=0, prompt_tokens=0, total_tokens=0)
@@ -105,8 +105,6 @@ def send_completion(
         return hash_object, CACHE[key]
 
     # del kwargs['stream']
-
-    # res = input("Paste your chatGPT response here: ")
 
     input("Press Enter to continue...")
     # Ensure the file exists by opening in append mode and then closing it
