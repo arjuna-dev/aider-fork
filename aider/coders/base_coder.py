@@ -44,6 +44,7 @@ import subprocess
 from time import sleep
 
 chrome_started = False
+tab = None
 
 def start_chrome():
     command = "/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --disable-extensions --user-data-dir=/tmp/chrome-debug-profile"
@@ -131,8 +132,7 @@ def send_message_to_chatgpt(message):
         print("Evaluate response:", response)
         print("Send button clicked.")
 
-        # Stop the tab
-        tab.stop()
+        return tab
 
     except Exception as e:
         print("Error:", e)
@@ -1647,7 +1647,7 @@ class Coder:
 
         messages_str = str(messages)
 
-        send_message_to_chatgpt(messages_str)
+        tab = send_message_to_chatgpt(messages_str)
 
         if not model:
             model = self.main_model
@@ -1665,6 +1665,7 @@ class Coder:
         completion = None
         try:
             hash_object, completion = send_completion(
+                tab,
                 model.name,
                 messages,
                 functions,

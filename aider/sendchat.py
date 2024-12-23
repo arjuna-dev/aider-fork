@@ -46,7 +46,7 @@ def generate_random_string(length=29):
     random_string = ''.join(random.choice(characters) for _ in range(length))
     return random_string
 
-def prepare_text(content: str) -> ModelResponse:
+def prepare_response(content: str) -> ModelResponse:
     random_string_1 = generate_random_string() # 'chatcmpl-9XEpc5YaNIltTVcv1sxmbsLJi1ZO7'
     message = Message(content=content, role='assistant')
     choice = Choices(finish_reason='stop', index=0, message=message)
@@ -62,6 +62,40 @@ def prepare_text(content: str) -> ModelResponse:
     )
     return model_response
 
+def fetch_chatgpt_response(tab):
+    try:
+        # Fetch the entire HTML of the last <article>
+        print("Fetching the HTML of the last <article>...")
+        response = tab.Runtime.evaluate(expression="""
+            (function() {
+                const articles = document.querySelectorAll('article');
+                if (articles.length === 0) return null;
+                const lastArticle = articles[articles.length - 1];
+                return lastArticle.innerText;
+            })();
+        """)
+
+        article_html = response.get('result', {}).get('value')
+
+        def remove_lines(text):
+            lines = text.split('\n')
+            # Remove the first 3 lines and the last 2 lines
+            lines = lines[3:-2]
+            return '\n'.join(lines)
+        
+        article_html = remove_lines(article_html)
+
+        print("Article HTML:", article_html)
+        # save the html to a file
+        with open('article.txt', 'w') as f:
+            f.write(article_html)
+            f.close()
+        return article_html
+
+    except Exception as e:
+        print("Error:", e)
+        return None
+
 # from diskcache import Cache
 
 
@@ -73,6 +107,7 @@ RETRY_TIMEOUT = 60
 
 
 def send_completion(
+    tab,
     model_name,
     messages,
     functions,
@@ -107,15 +142,14 @@ def send_completion(
     # del kwargs['stream']
 
     input("Press Enter to continue...")
-    # Ensure the file exists by opening in append mode and then closing it
+
+    fetch_chatgpt_response(tab)
     with open('response.txt', 'a'):
         pass
-
-    # Now read the file
     with open('response.txt', 'r') as file:
         res = file.read()
-    # res = res.encode().decode('unicode_escape')
-    res = prepare_text(res)
+
+    res = prepare_response(res)
 
     # res = litellm.completion(**kwargs)
 
