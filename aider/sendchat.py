@@ -10,8 +10,13 @@ from dataclasses import dataclass
 from typing import List
 import time
 
+import pychrome
 import random
 import string
+import subprocess
+from time import sleep
+
+chrome_started = False
 
 @dataclass
 class Usage:
@@ -62,6 +67,98 @@ def prepare_response(content: str) -> ModelResponse:
     )
     return model_response
 
+def start_chrome():
+    command = "/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --disable-extensions --user-data-dir=/tmp/chrome-debug-profile"
+
+    subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    sleep(1)
+
+# Callback for when the page navigation is complete
+def on_frame_stopped_loading(**kwargs):
+    global navigation_done
+    navigation_done = True
+    print("Navigation stopped.")
+
+def send_message_to_chatgpt(message):
+    def escape_string_for_js(input_string):
+        return (
+            input_string
+            .replace('\\', '\\\\')  # Escape backslashes
+            .replace('"', '\\"')    # Escape double quotes
+            .replace('\n', '\\n')   # Escape newlines
+        )
+    message = escape_string_for_js(message)
+    try:
+        # Connect to Chrome
+        browser = pychrome.Browser(url="http://127.0.0.1:9222")
+
+        # Use the first available tab (or create a new one if desired)
+        tabs = browser.list_tab()
+        tab = tabs[0] if tabs else browser.new_tab()
+
+        # Add the event listener for navigation
+        tab.Page.frameStoppedLoading = on_frame_stopped_loading
+
+        # Start the tab
+        tab.start()
+
+        # Navigate to the initial URL
+        print("Navigating to https://chatgpt.com...")
+        tab.Page.navigate(url="https://chatgpt.com")
+
+        # Wait for the initial navigation to complete
+        tab.wait(4)
+        print("Initial navigation complete.")
+
+        # Monitor until the user navigates to the desired URL
+        navigation_done = False
+        print("Waiting for user to navigate to https://chatgpt.com/?model=gpt-4o...")
+        while not navigation_done:
+            # Check the current URL
+            response = tab.Runtime.evaluate(expression="window.location.href")
+            print("Evaluate response:", response)
+            current_url = response["result"]["value"]
+            print(f"Current URL: {current_url}")
+
+            if current_url == "https://chatgpt.com/?model=gpt-4o":
+                print("Desired URL detected!")
+                break
+
+            # Sleep briefly to avoid busy waiting
+            time.sleep(2)
+
+        # Write to the <p> element
+        script = f"""
+        var pElement = document.querySelector('p[data-placeholder="Message ChatGPT"]');
+        if (pElement) {{
+            pElement.innerHTML = "{message}";
+        }} else {{
+            throw new Error("pElement not found");
+        }}
+        """
+        response = tab.Runtime.evaluate(expression=script)
+        print("Evaluate response:", response)
+        print("Text written to the <p> element.")
+
+        # Click the send button
+        script = """
+        var sendButton = document.querySelector('button[data-testid="send-button"]');
+        if (sendButton) {{
+            sendButton.click();
+        }} else {{
+            throw new Error("sendButton not found");
+        }}
+        """
+        response = tab.Runtime.evaluate(expression=script)
+        print("Evaluate response:", response)
+        print("Send button clicked.")
+
+        return tab
+
+    except Exception as e:
+        print("Error:", e)
+
+
 def fetch_chatgpt_response(tab):
     try:
         # Fetch the entire HTML of the last <article>
@@ -107,7 +204,6 @@ RETRY_TIMEOUT = 60
 
 
 def send_completion(
-    tab,
     model_name,
     messages,
     functions,
@@ -139,9 +235,19 @@ def send_completion(
     if not stream and CACHE is not None and key in CACHE:
         return hash_object, CACHE[key]
 
-    # del kwargs['stream']
+    global chrome_started
+    if not chrome_started:
+        start_chrome()
+        chrome_started = True
 
-    input("Press Enter to continue...")
+    with open('messages.txt', 'w') as file:
+        file.write(str(messages))
+
+    messages_str = str(messages)
+
+    tab = send_message_to_chatgpt(messages_str)
+
+    input("Press Enter when chatGPT response is ready")
 
     fetch_chatgpt_response(tab)
     with open('response.txt', 'a'):
